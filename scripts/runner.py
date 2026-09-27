@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -26,7 +27,23 @@ NOTEBOOK = SKILL_DIR / "assets" / "MiniMax_H3_Turbo_Colab.ipynb"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PICTURE_RE = re.compile(r"<Picture\s+(\d+)>")
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+JOB_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,48}")
+GPU_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 AUTH = os.environ.get("COLAB_AUTH", "oauth2")
+# Colab CLI releases the runner has been exercised against; anything else is
+# reported but still allowed, because the CLI self-updates between releases.
+VALIDATED_CLI_MINOR = {6, 7}
+MAX_LOG_CHARS = 400
+# Substrings that mark a line as prompt body rather than diagnostics.
+PROMPT_MARKERS = ("<Picture", "<Subject", "[Chinese]", "<d>", "subject_definitions", "overall_soundscape", "non_diegetic_music", "[Shot ")
+# The notebook needs a warm-up budget for cloning ComfyUI and pulling ~39-59 GiB
+# of weights; steady-state jobs on the same session reuse them.
+DEFAULT_EXEC_TIMEOUT = 3600.0
+DEFAULT_SETUP_TIMEOUT = 10800.0
+# Margin so the notebook's own deadline always fires before the CLI kills the
+# exec, which is what produces a usable error instead of a truncated one.
+INNER_DEADLINE_MARGIN_SECONDS = 300.0
 
 
 class ColabCommandError(RuntimeError):
@@ -34,7 +51,7 @@ class ColabCommandError(RuntimeError):
         self.label = label
         self.returncode = returncode
         self.output = output
-        tail = "\n".join(line for line in output[-12:] if line)
+        tail = "\n".join(line for line in (redact(line) for line in output[-12:]) if line)
         super().__init__(f"{label} failed (exit {returncode})" + (f":\n{tail}" if tail else ""))
 
 
@@ -48,6 +65,34 @@ def now_iso() -> str:
 
 def clean_output(value: str) -> str:
     return ANSI_RE.sub("", value).replace("\r", "").strip()
+
+
+def redact(value: str) -> str:
+    """Keep diagnostics, drop prompt body.
+
+    Long lines are where tracebacks and HTTP bodies live, so truncating beats
+    dropping them; prompt text is suppressed by marker instead of by length.
+    """
+    line = value.strip()
+    if not line:
+        return ""
+    if any(marker in line for marker in PROMPT_MARKERS):
+        return f"<prompt content suppressed, {len(line)} chars>"
+    if len(line) <= MAX_LOG_CHARS:
+        return line
+    return line[:MAX_LOG_CHARS] + f" …[+{len(line) - MAX_LOG_CHARS} chars]"
+
+
+def read_prompt_text(path: Path) -> str:
+    """Read a prompt file, tolerating a byte-order mark.
+
+    utf-8-sig strips a leading BOM and is a no-op otherwise, so the prompt body
+    still reaches the model exactly as authored.
+    """
+    text = path.read_text(encoding="utf-8-sig")
+    if "\ufeff" in text:
+        raise ValueError(f"Prompt file contains a stray byte-order mark: {path}")
+    return text
 
 
 def write_progress(path: Path | None, state: dict[str, Any]) -> None:
@@ -158,9 +203,40 @@ def check_cli() -> dict[str, str]:
     return {"version": version, "auth": AUTH}
 
 
+def cli_version_warning(version_text: str) -> str | None:
+    match = re.search(r"(\d+)\.(\d+)(?:\.\d+)?", version_text)
+    if not match:
+        return f"Could not parse the Colab CLI version from {redact(version_text)!r}; proceed with care."
+    major, minor = int(match.group(1)), int(match.group(2))
+    if major != 0 or minor not in VALIDATED_CLI_MINOR:
+        return f"Colab CLI {major}.{minor} is outside the validated range (0.{min(VALIDATED_CLI_MINOR)}-0.{max(VALIDATED_CLI_MINOR)}); the exec/upload flags may have moved."
+    return None
+
+
+def session_exists(session: str) -> bool:
+    """Ask the CLI whether a named session is already live.
+
+    `colab status --session NAME` exits 0 either way, printing "Session 'NAME'
+    not found." when absent, so the text is the only usable signal.
+    """
+    output = call_colab(["status", "--session", session], label="colab status", timeout=60)
+    return not re.search(rf"Session\s+'{re.escape(session)}'\s+not found\.?", output, re.IGNORECASE)
+
+
 def get_usage() -> dict[str, Any]:
     output = call_colab(["usage"], label="colab usage", timeout=30)
     return parse_usage(output)
+
+
+def validate_session_name(session: str) -> None:
+    if not SESSION_RE.fullmatch(session):
+        raise ValueError("Session name may contain only letters, numbers, underscores, and hyphens (up to 64 characters).")
+
+
+def validate_gpu(gpu: str) -> str:
+    if not GPU_RE.fullmatch(str(gpu)):
+        raise ValueError("GPU name must start with a letter or digit and may contain letters, numbers, underscores, and hyphens (up to 32 characters), e.g. A100 or T4.")
+    return str(gpu)
 
 
 def start_session(
@@ -169,8 +245,8 @@ def start_session(
     high_mem: bool,
     progress_path: Path | None = None,
 ) -> None:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session):
-        raise ValueError("Session name may contain only letters, numbers, underscores, and hyphens (up to 64 characters).")
+    validate_session_name(session)
+    validate_gpu(gpu)
     state: dict[str, Any] = {"task": "start", "status": "starting", "session": session, "gpu": gpu, "log_tail": [], "updated_at": now_iso()}
     write_progress(progress_path, state)
 
@@ -192,9 +268,23 @@ def start_session(
         raise
 
 
+def ensure_session(
+    session: str,
+    gpu: str,
+    high_mem: bool,
+    progress_path: Path | None = None,
+) -> bool:
+    """Return True when this process created the session and therefore owns it."""
+    validate_session_name(session)
+    validate_gpu(gpu)
+    if session_exists(session):
+        return False
+    start_session(session, gpu, high_mem, progress_path)
+    return True
+
+
 def stop_session(session: str, progress_path: Path | None = None) -> None:
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session):
-        raise ValueError("Invalid Colab session name.")
+    validate_session_name(session)
     state: dict[str, Any] = {"task": "stop", "status": "stopping", "session": session, "log_tail": [], "updated_at": now_iso()}
     write_progress(progress_path, state)
 
@@ -213,10 +303,17 @@ def stop_session(session: str, progress_path: Path | None = None) -> None:
         raise
 
 
-def safe_job_id(value: Any) -> str:
-    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,48}", value):
+def safe_job_id(value: Any, index: int) -> str:
+    """Reject an explicit but malformed id rather than silently randomising it.
+
+    A random id would move the remote paths and output filename on every run and
+    would bypass duplicate-id detection for ids the author meant to be explicit.
+    """
+    if value is None or value == "":
+        return uuid.uuid4().hex[:16]
+    if isinstance(value, str) and JOB_ID_RE.fullmatch(value):
         return value
-    return uuid.uuid4().hex[:16]
+    raise ValueError(f"Job {index} id {value!r} is invalid: use 1-48 characters from [A-Za-z0-9_-].")
 
 
 def safe_name(value: Any, fallback: str) -> str:
@@ -344,8 +441,11 @@ def resolve_jobs(manifest: dict[str, Any], output_dir: Path) -> list[dict[str, A
         if prompt_file:
             prompt_path = Path(str(prompt_file)).expanduser().resolve()
             if not prompt_path.is_file() or prompt_path.stat().st_size == 0:
-                raise ValueError(f"Prompt file is missing or empty: {prompt_path}")
-            prompt = prompt_path.read_text(encoding="utf-8")
+                raise ValueError(f"Job {index}: prompt file is missing or empty: {prompt_path}")
+            try:
+                prompt = read_prompt_text(prompt_path)
+            except ValueError as exc:
+                raise ValueError(f"Job {index}: {exc}") from exc
         else:
             prompt = str(raw.get("prompt", ""))
         if not prompt.strip():
@@ -354,14 +454,20 @@ def resolve_jobs(manifest: dict[str, Any], output_dir: Path) -> list[dict[str, A
         invalid = sorted({int(n) for n in PICTURE_RE.findall(prompt) if int(n) < 1 or int(n) > image_count})
         if invalid:
             raise ValueError(f"Job {index} prompt references Picture {invalid}; it has {image_count} images.")
-        duration = float(raw.get("duration_seconds", raw.get("duration", 12)))
+        try:
+            duration = float(raw.get("duration_seconds", raw.get("duration", 12)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Job {index} duration must be a number of seconds, got {raw.get('duration_seconds', raw.get('duration', 12))!r}.") from exc
         if not math.isfinite(duration) or not 4 <= duration <= 15:
             raise ValueError(f"Job {index} duration must be between 4 and 15 seconds.")
-        seed = raw.get("seed")
-        seed = random.SystemRandom().randrange(0, 2**64) if seed in (None, "") else int(seed)
+        raw_seed = raw.get("seed")
+        try:
+            seed = random.SystemRandom().randrange(0, 2**64) if raw_seed in (None, "") else int(raw_seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Job {index} seed must be an integer, got {raw_seed!r}.") from exc
         if not 0 <= seed < 2**64:
             raise ValueError(f"Job {index} seed must be between 0 and 2^64-1.")
-        job_id = safe_job_id(raw.get("id"))
+        job_id = safe_job_id(raw.get("id"), index)
         if job_id in seen_ids:
             raise ValueError(f"Job {index} duplicates job id {job_id!r}.")
         seen_ids.add(job_id)
@@ -383,12 +489,18 @@ def resolve_jobs(manifest: dict[str, Any], output_dir: Path) -> list[dict[str, A
     return resolved
 
 
-def verify_mp4(path: Path) -> None:
+def verify_mp4(path: Path, require_audio: bool = False) -> list[str]:
+    """Confirm a usable render. Returns warnings; raises only on unusable output.
+
+    A silent-but-valid video is a usable result, not a lost one: raising here
+    used to discard a fully paid-for render that had merely come back without an
+    audio stream.
+    """
     if not path.is_file() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Downloaded MP4 is missing or empty: {path}")
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return
+        return ["ffprobe is not installed, so stream layout was not checked."]
     probe = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(path)],
         capture_output=True,
@@ -399,8 +511,14 @@ def verify_mp4(path: Path) -> None:
     if probe.returncode != 0:
         raise ValueError(f"Downloaded output is not a readable MP4: {clean_output(probe.stderr)}")
     streams = {item.get("codec_type") for item in json.loads(probe.stdout).get("streams", [])}
-    if not {"video", "audio"} <= streams:
-        raise ValueError(f"Downloaded MP4 must contain video and audio streams; found {sorted(streams)}.")
+    if "video" not in streams:
+        raise ValueError(f"Downloaded MP4 has no video stream; found {sorted(streams)}.")
+    if "audio" not in streams:
+        message = f"Downloaded MP4 has no audio stream; found {sorted(streams)}."
+        if require_audio:
+            raise ValueError(message)
+        return [message]
+    return []
 
 
 def run_batch(
@@ -413,50 +531,66 @@ def run_batch(
     progress_path: Path | None,
     output_dir: Path,
     exec_timeout: float,
-    create_session_if_named: bool = False,
+    setup_timeout: float = DEFAULT_SETUP_TIMEOUT,
+    require_audio: bool = False,
 ) -> dict[str, Any]:
     if not NOTEBOOK.is_file():
         raise FileNotFoundError(f"Bundled inference notebook not found: {NOTEBOOK}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     jobs = resolve_jobs(manifest, output_dir)
-    owns_session = session is None or create_session_if_named
+    validate_gpu(gpu)
     if session is None:
         session = f"h3-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:6]}"
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session):
-        raise ValueError("Invalid Colab session name.")
+    validate_session_name(session)
 
     progress: dict[str, Any] = {
         "task": "batch",
         "status": "starting",
         "session": session,
         "gpu": gpu,
+        "exec_timeout_seconds": exec_timeout,
+        "setup_timeout_seconds": setup_timeout,
         "jobs": [{"id": job["id"], "title": job["title"], "status": "queued", "output": str(job["output_path"])} for job in jobs],
         "log_tail": [],
         "updated_at": now_iso(),
     }
     write_progress(progress_path, progress)
+    warnings: list[str] = []
+
+    cli = check_cli()
+    progress["colab_cli_version"] = redact(cli["version"])
+    version_warning = cli_version_warning(cli["version"])
+    if version_warning:
+        warnings.append(version_warning)
+    write_progress(progress_path, progress)
 
     def log_line(line: str) -> None:
-        # Avoid copying full prompt text into logs/state files.
-        if not line or len(line) > 320 or "<Picture" in line or "<Subject" in line or "[Chinese]" in line:
+        safe = redact(line)
+        if not safe:
             return
-        progress["log_tail"] = (progress["log_tail"] + [line])[-30:]
+        progress["log_tail"] = (progress["log_tail"] + [safe])[-30:]
         progress["updated_at"] = now_iso()
         write_progress(progress_path, progress)
 
     results: list[dict[str, Any]] = []
     batch_error: str | None = None
-    work_root = manifest_path.parent / f"work_{uuid.uuid4().hex[:8]}"
-    work_root.mkdir(parents=True, exist_ok=True)
+    owns_session = False
+    # Job prompts are transient; keep them out of the user's manifest and output
+    # directories, which may be synced or shared.
+    work_root = Path(tempfile.mkdtemp(prefix="h3_work_"))
+    os.chmod(work_root, 0o700)
     try:
-        if owns_session:
-            start_session(session, gpu, high_mem)
+        owns_session = ensure_session(session, gpu, high_mem)
+        progress["session_ownership"] = "created" if owns_session else "reused"
         progress["status"] = "running"
         progress["updated_at"] = now_iso()
         write_progress(progress_path, progress)
 
         for index, job in enumerate(jobs):
             current = progress["jobs"][index]
+            # The first exec pays for the ComfyUI install and the 39-59 GiB weight
+            # download; later execs on the same session reuse both.
+            budget = setup_timeout if index == 0 else exec_timeout
             current.update({"status": "uploading", "started_at": now_iso()})
             progress["current_job"] = job["id"]
             progress["updated_at"] = now_iso()
@@ -495,16 +629,23 @@ def run_batch(
                 "H3_SEED=" + str(job["seed"]),
                 "H3_OUTPUT_PREFIX=MiniMax_H3_" + job["id"][:20],
                 "H3_OUTPUT_PATH=" + remote_output,
-                "H3_JOB_TIMEOUT_SECONDS=" + str(min(exec_timeout, 7200)),
+                # Must stay below the CLI's own kill, otherwise the notebook can
+                # never report its own deadline and the error is a bare timeout.
+                "H3_JOB_TIMEOUT_SECONDS=" + str(max(60.0, budget - INNER_DEADLINE_MARGIN_SECONDS)),
             ]
-            exec_args = ["exec", "--session", session, "--timeout", str(exec_timeout)]
+            exec_args = ["exec", "--session", session, "--timeout", str(budget)]
             for value in env_values:
                 exec_args.extend(["--env", value])
             exec_args.extend(["--file", str(notebook_copy)])
-            current.update({"status": "generating", "seed": job["seed"], "duration_seconds": job["duration_seconds"]})
+            current.update({
+                "status": "generating",
+                "seed": job["seed"],
+                "duration_seconds": job["duration_seconds"],
+                "exec_timeout_seconds": budget,
+            })
             progress["updated_at"] = now_iso()
             write_progress(progress_path, progress)
-            call_colab(exec_args, label=f"generate {job['title']}", timeout=exec_timeout + 60, on_line=log_line)
+            call_colab(exec_args, label=f"generate {job['title']}", timeout=budget + 60, on_line=log_line)
 
             current["status"] = "downloading"
             progress["updated_at"] = now_iso()
@@ -515,7 +656,8 @@ def run_batch(
                 timeout=900,
                 on_line=log_line,
             )
-            verify_mp4(job["output_path"])
+            for warning in verify_mp4(job["output_path"], require_audio=require_audio):
+                warnings.append(f"{job['title']}: {warning}")
             current.update({"status": "completed", "finished_at": now_iso(), "bytes": job["output_path"].stat().st_size})
             results.append({"id": job["id"], "output": str(job["output_path"]), "status": "completed"})
             progress["updated_at"] = now_iso()
@@ -552,7 +694,10 @@ def run_batch(
                 batch_error = batch_error or f"Batch ended, but Colab session {session} could not be stopped: {exc}"
         elif not owns_session:
             progress["session_status"] = "active"
-        shutil.rmtree(work_root, ignore_errors=True)
+        try:
+            shutil.rmtree(work_root)
+        except OSError as exc:
+            warnings.append(f"Temporary job directory could not be removed and may contain prompt text: {work_root} ({exc})")
 
     completed = sum(item["status"] == "completed" for item in progress["jobs"])
     failed = sum(item["status"] == "failed" for item in progress["jobs"])
@@ -563,6 +708,7 @@ def run_batch(
         "failed_count": failed,
         "cancelled_count": cancelled,
         "error": batch_error,
+        "warnings": warnings,
         "updated_at": now_iso(),
         "results": results,
     })
@@ -579,7 +725,7 @@ def main() -> int:
 
     start_parser = sub.add_parser("start", help="Create a persistent Colab GPU session")
     start_parser.add_argument("--session", required=True)
-    start_parser.add_argument("--gpu", default="A100")
+    start_parser.add_argument("--gpu", default="A100", type=validate_gpu)
     start_parser.add_argument("--no-high-mem", action="store_true")
     start_parser.add_argument("--progress", type=Path)
 
@@ -589,21 +735,28 @@ def main() -> int:
 
     batch_parser = sub.add_parser("batch", help="Render multiple videos sequentially on one Colab session")
     batch_parser.add_argument("--manifest", type=Path, required=True)
-    batch_parser.add_argument("--session", help="Reuse an existing session instead of creating one")
-    batch_parser.add_argument("--gpu", default=os.environ.get("COLAB_GPU", "A100"))
+    batch_parser.add_argument("--session", help="Reuse an existing session if it is live, else create it")
+    batch_parser.add_argument("--gpu", default=os.environ.get("COLAB_GPU", "A100"), type=validate_gpu)
     batch_parser.add_argument("--no-high-mem", action="store_true")
     batch_parser.add_argument("--stop-on-complete", action="store_true", help="Stop even a provided session after this queue")
+    batch_parser.add_argument("--require-audio", action="store_true", help="Fail a job whose MP4 has no audio stream")
     batch_parser.add_argument("--progress", type=Path)
     batch_parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    batch_parser.add_argument("--timeout", type=float, default=float(os.environ.get("COLAB_EXEC_TIMEOUT", "3600")))
+    batch_parser.add_argument("--timeout", type=float, default=float(os.environ.get("COLAB_EXEC_TIMEOUT", str(DEFAULT_EXEC_TIMEOUT))), help="Per-job execution budget once the runtime is warm")
+    batch_parser.add_argument("--setup-timeout", type=float, default=float(os.environ.get("COLAB_SETUP_TIMEOUT", str(DEFAULT_SETUP_TIMEOUT))), help="Execution budget for the first job, which installs ComfyUI and downloads weights")
 
     single_parser = sub.add_parser("single", help="Compatibility interface for run_colab_inference.sh")
     single_parser.add_argument("--image", "-i", action="append", required=True)
     single_parser.add_argument("--prompt", "-p", required=True)
     single_parser.add_argument("--output", "-o")
-    single_parser.add_argument("--gpu", default=os.environ.get("COLAB_GPU", "A100"))
+    single_parser.add_argument("--progress", type=Path)
+    single_parser.add_argument("--seed", type=int)
+    single_parser.add_argument("--gpu", default=os.environ.get("COLAB_GPU", "A100"), type=validate_gpu)
     single_parser.add_argument("--no-high-mem", action="store_true")
-    single_parser.add_argument("--timeout", type=float, default=float(os.environ.get("COLAB_EXEC_TIMEOUT", "3600")))
+    single_parser.add_argument("--require-audio", action="store_true")
+    single_parser.add_argument("--stop-on-complete", action="store_true", help="Stop a reused session after this run")
+    single_parser.add_argument("--timeout", type=float, default=float(os.environ.get("COLAB_EXEC_TIMEOUT", str(DEFAULT_EXEC_TIMEOUT))))
+    single_parser.add_argument("--setup-timeout", type=float, default=float(os.environ.get("COLAB_SETUP_TIMEOUT", str(DEFAULT_SETUP_TIMEOUT))))
 
     args = parser.parse_args()
     try:
@@ -629,32 +782,44 @@ def main() -> int:
         if args.command == "single":
             first = Path(args.image[0]).expanduser().resolve()
             output = Path(args.output).expanduser().resolve() if args.output else first.with_name(first.stem + "_minimax_h3.mp4")
-            manifest = {
-                "jobs": [{
-                    "title": output.stem,
-                    "prompt_file": str(Path(args.prompt).expanduser().resolve()),
-                    "reference_images": args.image,
-                    "duration_seconds": float(os.environ.get("H3_DURATION_SECONDS", "12")),
-                    "output_path": str(output),
-                }]
+            raw_duration = os.environ.get("H3_DURATION_SECONDS", "12")
+            try:
+                duration = float(raw_duration)
+            except ValueError:
+                raise ValueError(f"H3_DURATION_SECONDS must be a number of seconds, got {raw_duration!r}.") from None
+            job: dict[str, Any] = {
+                "title": output.stem,
+                "prompt_file": str(Path(args.prompt).expanduser().resolve()),
+                "reference_images": args.image,
+                "duration_seconds": duration,
+                "output_path": str(output),
             }
-            temp_manifest = output.parent / f".h3_{uuid.uuid4().hex[:10]}.json"
-            temp_manifest.parent.mkdir(parents=True, exist_ok=True)
-            temp_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            if args.seed is not None:
+                job["seed"] = args.seed
+            elif os.environ.get("H3_SEED"):
+                job["seed"] = int(os.environ["H3_SEED"])
+            progress_path = args.progress.expanduser().resolve() if args.progress else output.with_suffix(".progress.json")
+            temp_dir = Path(tempfile.mkdtemp(prefix="h3_manifest_"))
+            os.chmod(temp_dir, 0o700)
+            temp_manifest = temp_dir / "job.json"
+            temp_manifest.write_text(json.dumps({"jobs": [job]}, ensure_ascii=False), encoding="utf-8")
             try:
                 progress = run_batch(
                     temp_manifest,
                     session=os.environ.get("COLAB_SESSION_NAME"),
                     gpu=args.gpu,
                     high_mem=not args.no_high_mem,
-                    stop_on_complete=True,
-                    progress_path=None,
+                    stop_on_complete=args.stop_on_complete,
+                    progress_path=progress_path,
                     output_dir=output.parent,
                     exec_timeout=args.timeout,
-                    create_session_if_named=True,
+                    setup_timeout=args.setup_timeout,
+                    require_audio=args.require_audio,
                 )
             finally:
-                temp_manifest.unlink(missing_ok=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            for warning in progress.get("warnings", []):
+                print(f"Warning: {warning}", file=sys.stderr)
             if progress["status"] != "completed":
                 print(progress.get("error") or "One or more videos failed.", file=sys.stderr)
                 return 1
@@ -670,7 +835,11 @@ def main() -> int:
                 progress_path=args.progress.expanduser().resolve() if args.progress else None,
                 output_dir=args.output_dir.expanduser().resolve(),
                 exec_timeout=args.timeout,
+                setup_timeout=args.setup_timeout,
+                require_audio=args.require_audio,
             )
+            for warning in progress["warnings"]:
+                print(f"Warning: {warning}", file=sys.stderr)
             print(json.dumps(progress, ensure_ascii=False))
             return 0 if progress["status"] == "completed" else 1
     except Exception as exc:
