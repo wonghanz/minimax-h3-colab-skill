@@ -8,6 +8,7 @@ This repository is a standalone Codex skill for creating short MiniMax H3 Ref2VA
 
 - [繁體中文完整說明](README.zh-TW.md)
 - [Full English documentation](README.en.md)
+- [Changes on this fork](CHANGES.md) — 17 hardening fixes on `fix/colab-runner-hardening`, not merged upstream
 
 ## Quick start / 快速開始
 
