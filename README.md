@@ -39,4 +39,8 @@ After OAuth2 is complete, run one inference with:
 
 Repeat `--image` for 1–9 ordered references. Their order maps to `<Picture 1>` through `<Picture 9>`, and the UTF-8 prompt file is uploaded verbatim to the notebook.
 
+The first job on a fresh runtime pays for the ComfyUI install and the weight download, so it gets `COLAB_SETUP_TIMEOUT` (default 10800 seconds); later jobs on the same session get `COLAB_EXEC_TIMEOUT`. Pass `--seed` to make a clip reproducible, and progress is written next to the output as `<output>.progress.json`.
+
+新 runtime 的第一個工作要安裝 ComfyUI 並下載權重，因此使用 `COLAB_SETUP_TIMEOUT`（預設 10800 秒）；同一 session 的後續工作才用 `COLAB_EXEC_TIMEOUT`。用 `--seed` 可重現同一個結果，狀態檔則預設寫在輸出檔旁邊（`<輸出檔>.progress.json`）。
+
 The runner uses Colab compute units and remote GPU allocation. It does not run the H3 model on the local computer. See the language-specific README for prerequisites, batch manifests, session behavior, limits, and troubleshooting.
