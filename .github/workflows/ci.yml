@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The contract tests skip themselves without the CLI; installing it keeps
+      # the flags this repo shells out to pinned against upstream renames.
+      - name: Install google-colab-cli
+        run: pip install google-colab-cli
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check the runner entry points
+        run: |
+          python scripts/runner.py --help
+          bash run_colab_inference.sh --help
